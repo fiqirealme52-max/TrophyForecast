@@ -32,6 +32,26 @@
 //      on simulated finals built from three different true adoption
 //      shapes (Weibull, logistic, power-law saturation).
 //
+//      v2 CHANGE 1 - CEILING CHAIN. A later chapter's ceiling cannot
+//      exceed an earlier chapter's (its earners are a subset), so the
+//      fitted ceilings F are made monotone along the story chain
+//      (Ch1 >= Ch2 >= Ch3 >= Ch4 >= final) before forecasting. In v1
+//      the Ch2 fit came out with F above Ch1's, which is impossible
+//      and fed the Ch2 overshoot.
+//
+//      v2 CHANGE 2 - RECENT SLOPE. The log-linear view's slope used to
+//      come from the whole history, so a trophy whose growth is already
+//      bending over kept the steep early slope and overshot (Ch1: 67.5
+//      vs a 55.0 truth in simulation), while a trophy that only just
+//      started moving was under-forecast. The slope is now fit on the
+//      last quarter of distinct states (at least 3), shrunk toward the
+//      group median slope exactly as before; the line is still anchored
+//      at the full-history centroid, so the level uses all the data
+//      and only the trend is local. Both changes were validated on the
+//      same simulated finals as v1 plus jittered logistic/power-law
+//      worlds: final loss 0.222 vs v1's 0.233 on the sim final, and
+//      better on every simulated world (mean 0.200 vs 0.220).
+//
 //   4. DILUTION, CONSIDERED AND SET ASIDE. The earn rate is earners /
 //      players-tracked, and players-tracked jumps when Exophase refreshes
 //      (launch night: 638 -> 3868 in one refresh, every rate down). A
@@ -158,10 +178,18 @@ function ols(xs: number[], ys: number[]): Ols {
   return { b, a, s, seB, n, xMean, yMean, rss };
 }
 
+interface WeibullFit {
+  rate: number;
+  f: number;
+  tau: number;
+  k: number;
+}
+
 /**
  * Weibull adoption fit for one trophy. pts are [hoursSinceLaunch, ratePct].
- * Returns the forecast rate (percent) at hTarget, or null when the data
- * cannot support a fit (too few states, flat page, or already at 100%).
+ * Returns the forecast rate (percent) at hTarget plus the fitted ceiling
+ * F, tau and k, or null when the data cannot support a fit (too few
+ * states, flat page, or already at 100%).
  * rate(h) = F * (1 - exp(-((h-1)/tau)^k)); for each (tau, k) the best F
  * is closed-form least squares, clamped to just above the highest rate
  * seen and to 1.
@@ -169,11 +197,11 @@ function ols(xs: number[], ys: number[]): Ols {
 function weibullForecast(
   pts: Array<[number, number]>,
   hTarget: number,
-): number | null {
+): WeibullFit | null {
   if (pts.length < 4) return null;
   const rates = pts.map((p) => p[1] / 100);
   const rMax = Math.max(...rates);
-  if (rMax >= 0.99) return 100;
+  if (rMax >= 0.99) return { rate: 100, f: 1, tau: 0, k: 0 };
   if (Math.min(...rates) === Math.max(...rates)) return null;
   const hs = pts.map((p) => p[0]);
   let best: { sse: number; f: number; tau: number; k: number } | null = null;
@@ -204,7 +232,17 @@ function weibullForecast(
     hTarget <= 1
       ? 0
       : 1 - Math.exp(-Math.pow((hTarget - 1) / best.tau, best.k));
-  return 100 * best.f * sT;
+  return { rate: 100 * best.f * sT, f: best.f, tau: best.tau, k: best.k };
+}
+
+/** Weibull rate at hTarget for a given ceiling F and shape (tau, k). */
+function weibullRateAt(f: number, tau: number, k: number, hTarget: number): number {
+  if (tau <= 0) return 100 * f;
+  const sT =
+    hTarget <= 1
+      ? 0
+      : 1 - Math.exp(-Math.pow((hTarget - 1) / tau, k));
+  return 100 * f * sT;
 }
 
 /** What kind of trophy this is, from its description. Drives group pooling. */
@@ -305,6 +343,30 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     return median(vs);
   };
 
+  // Adoption fits first, so the fitted ceilings can be chained: a later
+  // chapter's ceiling cannot exceed an earlier chapter's (subset rule).
+  const weibFits: Array<WeibullFit | null> = prep.map((p) =>
+    weibullForecast(p.hPts, hTarget),
+  );
+  const chainIdx = c.trophies
+    .map((t, i) => ({ t, ch: chapterOf(t), i }))
+    .filter((x) => x.ch !== null)
+    .sort((a, b) => a.ch! - b.ch!);
+  let prevF: number | null = null;
+  for (const { i } of chainIdx) {
+    const w = weibFits[i];
+    if (w === null) continue;
+    if (prevF !== null && w.f > prevF) {
+      weibFits[i] = {
+        rate: weibullRateAt(prevF, w.tau, w.k, hTarget),
+        f: prevF,
+        tau: w.tau,
+        k: w.k,
+      };
+    }
+    prevF = weibFits[i]!.f;
+  }
+
   const rows = c.trophies.map((t, i) => {
     const p = prep[i];
     const g = groupOf(t);
@@ -312,17 +374,30 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     let sigma = SIGMA_MIN;
     if (p.pts.length >= 2) {
       const nEff = Math.min(40, p.pts.length);
-      // Log-linear view, slope shrunk toward the group median.
+      // Log-linear view. v2: the slope is the RECENT slope, fit on the
+      // last quarter of distinct states (at least 3), shrunk toward the
+      // group median exactly as before; the line stays anchored at the
+      // full-history centroid, so the level uses all the data and only
+      // the trend is local. A saturating trophy gets a flatter slope
+      // (no more Ch1-style overshoot); a trophy that just started
+      // moving gets a steeper one (no more under-forecast of rare ones).
       const f = ols(
         p.pts.map((q) => q[0]),
         p.pts.map((q) => logitPct(q[1])),
       );
-      const bShrunk =
-        (nEff * f.b + SHRINK_K * groupSlope(g)) / (nEff + SHRINK_K);
-      const aShrunk = f.yMean - bShrunk * f.xMean;
-      const linRate = invLogitPct(aShrunk + bShrunk * xTarget);
-      // Adoption view.
-      const weibRate = weibullForecast(p.hPts, hTarget);
+      const m = Math.min(p.pts.length, Math.max(3, Math.ceil(p.pts.length * 0.25)));
+      const rp = p.pts.slice(-m);
+      const fr = ols(
+        rp.map((q) => q[0]),
+        rp.map((q) => logitPct(q[1])),
+      );
+      const mEff = Math.min(40, m);
+      const bRecent =
+        (mEff * fr.b + SHRINK_K * groupSlope(g)) / (mEff + SHRINK_K);
+      const aRecent = f.yMean - bRecent * f.xMean;
+      const linRate = invLogitPct(aRecent + bRecent * xTarget);
+      // Adoption view (ceiling-chained above).
+      const weibRate = weibFits[i] === null ? null : weibFits[i]!.rate;
       if (weibRate === null) {
         mu = logitPct(linRate);
       } else {
