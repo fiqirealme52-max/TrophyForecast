@@ -52,6 +52,45 @@
 //      worlds: final loss 0.222 vs v1's 0.233 on the sim final, and
 //      better on every simulated world (mean 0.200 vs 0.220).
 //
+//      v3 CHANGE 1 - HONEST SPREAD, RESCALED. v2's spread was far wider
+//      than its own median errors: on 28 simulated finals the v2
+//      median's |logit error| is p50 0.105 / p90 0.402 / max 0.892,
+//      while sigma runs 0.6-1.6, so the 90% band covered 98.2% of
+//      trophies (an honest band covers ~90%). Pinball loss charges for
+//      every unit of needless width, so the whole sigma is rescaled by
+//      0.70 (effective range 0.42-1.12). The rescale wins on ALL 28
+//      simulated worlds and survives stress tests that make the median
+//      systematically wrong (bias +/-0.4 logit for every trophy, or
+//      per-trophy noise sd 0.5): it still beats v2 on mean loss in
+//      every stress scenario. The scale stops at 0.70, deliberately
+//      above the sim optimum (~0.55-0.60), as a margin for the real
+//      final being weirder than any simulation (unknown refresh
+//      cadence, unknown true adoption shape, player-growth surprises).
+//      Sim final f00: 0.2221 -> 0.1618; mean over 10 worlds 0.2002 ->
+//      0.1526; mean over 28 worlds 0.2078 -> 0.1601; worst world
+//      0.2310 -> 0.1701 (10 worlds) and 0.2540 -> 0.2092 (28 worlds).
+//
+//      TESTED AND REJECTED - BLEND REWEIGHTING. Weighting the logit
+//      blend 0.6 log-linear / 0.4 Weibull was tried: it helps on
+//      logistic worlds (-5%) and powersat worlds (-1.5%) but hurts on
+//      EVERY Weibull world (+1.4% to +2.9%, f00 0.1618 -> 0.1665),
+//      because when the truth is Weibull the Weibull view is
+//      well-specified and deserves its half. Over 28 worlds it helps
+//      15 and hurts 13 - a coin flip that bets against the canonical
+//      adoption shape. The 50/50 blend stays.
+//
+//      TESTED AND REJECTED - everything else in this round: SHRINK_K
+//      3/9/12 and per-group SHRINK_K (within +/-2%, no gain); recent
+//      window 0.15/0.20/0.33 (within +/-1%); target shift -1.5h/-3h
+//      (within -0.4%, an artifact of the sim's 6h refresh grid);
+//      finer Weibull (tau,k) grid (within +/-1%); Theil-Sen robust
+//      slope (no change); rate-space blend (-0.6%, within noise).
+//      Per-group sigma scaling was considered (side/story trophies
+//      have larger median errors, p90 0.59/0.49 vs 0.25-0.39 for the
+//      other groups) but not adopted: the global rescale already wins
+//      on all 28 worlds, and tuning five more constants on 28 sim
+//      worlds would be overfitting.
+//
 //   4. DILUTION, CONSIDERED AND SET ASIDE. The earn rate is earners /
 //      players-tracked, and players-tracked jumps when Exophase refreshes
 //      (launch night: 638 -> 3868 in one refresh, every rate down). A
@@ -77,6 +116,7 @@
 //      wider than the house baseline's on a flat page (the practice
 //      refresh proves a flat page can jump), and narrower than the
 //      baseline's 0.5*sqrt(days) where the full-history fit is confident.
+//      v3 rescales the whole spread by SIGMA_SCALE = 0.70 (see above).
 //
 // Deterministic: pure arithmetic on the case file, no randomness, no
 // clock, inputs read in name order. Node 22, standard library only.
@@ -99,6 +139,8 @@ const SIGMA_FLOOR = 0.4;
 /** Spread clamp, logit units. */
 const SIGMA_MIN = 0.6;
 const SIGMA_MAX = 1.6;
+/** v3: rescale for the whole spread (see header, change 1). */
+const SIGMA_SCALE = 0.7;
 /** Weibull shape grid. */
 const WEIBULL_TAUS = [4, 6, 8, 12, 18, 25, 35, 50, 70, 100, 150, 220, 320];
 const WEIBULL_KS = [0.8, 1.0, 1.2, 1.4, 1.7, 2.0, 2.5];
@@ -401,6 +443,9 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       if (weibRate === null) {
         mu = logitPct(linRate);
       } else {
+        // 50/50 logit blend (a 0.6/0.4 reweight was tested and rejected:
+        // it helps logistic/powersat worlds but hurts every Weibull
+        // world, including the sim final - see header).
         mu = (logitPct(linRate) + logitPct(weibRate)) / 2;
       }
       const dx = Math.max(0, xTarget - f.xMean);
@@ -411,7 +456,13 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
         Math.min(0.5, 0.2 * move) ** 2 +
         SIGMA_REFRESH ** 2 +
         SIGMA_FLOOR ** 2;
-      sigma = Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, Math.sqrt(varSigma)));
+      // v3: rescale the whole spread (see header, change 1). Effective
+      // range after rescaling is 0.42-1.12; the 0.3 floor never binds,
+      // it only guards the scale factor itself.
+      sigma = Math.min(
+        SIGMA_MAX,
+        Math.max(0.3, Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, Math.sqrt(varSigma))) * SIGMA_SCALE),
+      );
     }
     const q = Z.map((z) => round4(invLogitPct(mu + z * sigma)));
     return { id: t.id, q };
